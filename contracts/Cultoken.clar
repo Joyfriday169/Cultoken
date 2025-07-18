@@ -14,6 +14,13 @@
 (define-constant err-invalid-coordinates (err u109))
 (define-constant err-fundraising-not-active (err u110))
 (define-constant err-goal-already-reached (err u111))
+(define-constant err-lease-not-found (err u112))
+(define-constant err-lease-expired (err u113))
+(define-constant err-lease-still-active (err u114))
+(define-constant err-invalid-lease-duration (err u115))
+(define-constant err-site-already-leased (err u116))
+(define-constant err-not-lessee (err u117))
+(define-constant err-lease-payment-failed (err u118))
 
 (define-data-var last-token-id uint u0)
 (define-data-var base-token-uri (string-ascii 210) "https://cultoken.heritage/metadata/")
@@ -45,6 +52,34 @@
 
 (define-map token-donations uint (list 50 {donor: principal, amount: uint, timestamp: uint}))
 (define-map user-donations principal uint)
+
+(define-map heritage-leases uint {
+    lessor: principal,
+    lessee: principal,
+    lease-price: uint,
+    lease-duration: uint,
+    lease-start: uint,
+    lease-end: uint,
+    active: bool,
+    revenue-sharing: uint,
+    auto-renew: bool
+})
+
+(define-map lease-applications uint (list 20 {
+    applicant: principal,
+    offered-price: uint,
+    requested-duration: uint,
+    application-time: uint,
+    status: (string-ascii 16)
+}))
+
+(define-map user-lease-history principal (list 100 {
+    token-id: uint,
+    role: (string-ascii 8),
+    start-block: uint,
+    end-block: uint,
+    lease-price: uint
+}))
 
 (define-public (get-last-token-id)
     (ok (var-get last-token-id))
@@ -253,6 +288,222 @@
                 is-complete: (>= current goal)
             })
         )
+        none
+    )
+)
+
+(define-public (offer-lease (token-id uint) (lease-price uint) (lease-duration uint) (revenue-sharing uint))
+    (let 
+        (
+            (token-owner (unwrap! (nft-get-owner? heritage-site token-id) err-not-found))
+            (current-lease (map-get? heritage-leases token-id))
+        )
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+        (asserts! (> lease-duration u0) err-invalid-lease-duration)
+        (asserts! (<= lease-duration u52560) err-invalid-lease-duration)
+        (asserts! (<= revenue-sharing u100) err-invalid-lease-duration)
+        (asserts! (is-none current-lease) err-site-already-leased)
+        
+        (map-set heritage-leases token-id {
+            lessor: tx-sender,
+            lessee: tx-sender,
+            lease-price: lease-price,
+            lease-duration: lease-duration,
+            lease-start: u0,
+            lease-end: u0,
+            active: false,
+            revenue-sharing: revenue-sharing,
+            auto-renew: false
+        })
+        (ok true)
+    )
+)
+
+(define-public (apply-for-lease (token-id uint) (offered-price uint) (requested-duration uint))
+    (let 
+        (
+            (lease-offer (unwrap! (map-get? heritage-leases token-id) err-lease-not-found))
+            (current-applications (default-to (list) (map-get? lease-applications token-id)))
+            (new-application {
+                applicant: tx-sender,
+                offered-price: offered-price,
+                requested-duration: requested-duration,
+                application-time: stacks-block-height,
+                status: "pending"
+            })
+        )
+        (asserts! (not (get active lease-offer)) err-site-already-leased)
+        (asserts! (> offered-price u0) err-invalid-price)
+        (asserts! (> requested-duration u0) err-invalid-lease-duration)
+        
+        (map-set lease-applications token-id
+            (unwrap! (as-max-len? (append current-applications new-application) u20) (err u999)))
+        (ok true)
+    )
+)
+
+(define-public (accept-lease-application (token-id uint) (applicant principal))
+    (let 
+        (
+            (lease-offer (unwrap! (map-get? heritage-leases token-id) err-lease-not-found))
+            (applications (unwrap! (map-get? lease-applications token-id) err-lease-not-found))
+            (lease-start-block stacks-block-height)
+        )
+        (asserts! (is-eq tx-sender (get lessor lease-offer)) err-not-token-owner)
+        (asserts! (not (get active lease-offer)) err-site-already-leased)
+        
+        (let 
+            (
+                (accepted-app (unwrap! 
+                    (element-at? 
+                        (filter check-applicant applications) 
+                        u0
+                    ) 
+                    err-lease-not-found
+                ))
+                (lease-end-block (+ lease-start-block (get requested-duration accepted-app)))
+                (updated-history (default-to (list) (map-get? user-lease-history applicant)))
+                (lessor-history (default-to (list) (map-get? user-lease-history tx-sender)))
+            )
+            
+            (try! (stx-transfer? (get offered-price accepted-app) applicant tx-sender))
+            
+            (map-set heritage-leases token-id {
+                lessor: tx-sender,
+                lessee: applicant,
+                lease-price: (get offered-price accepted-app),
+                lease-duration: (get requested-duration accepted-app),
+                lease-start: lease-start-block,
+                lease-end: lease-end-block,
+                active: true,
+                revenue-sharing: (get revenue-sharing lease-offer),
+                auto-renew: false
+            })
+            
+            (map-set user-lease-history applicant
+                (unwrap! (as-max-len? (append updated-history {
+                    token-id: token-id,
+                    role: "lessee",
+                    start-block: lease-start-block,
+                    end-block: lease-end-block,
+                    lease-price: (get offered-price accepted-app)
+                }) u100) (err u999)))
+            
+            (map-set user-lease-history tx-sender
+                (unwrap! (as-max-len? (append lessor-history {
+                    token-id: token-id,
+                    role: "lessor",
+                    start-block: lease-start-block,
+                    end-block: lease-end-block,
+                    lease-price: (get offered-price accepted-app)
+                }) u100) (err u999)))
+            
+            (map-delete lease-applications token-id)
+            (ok true)
+        )
+    )
+)
+
+(define-public (end-lease (token-id uint))
+    (let 
+        (
+            (lease-data (unwrap! (map-get? heritage-leases token-id) err-lease-not-found))
+        )
+        (asserts! (get active lease-data) err-lease-not-found)
+        (asserts! 
+            (or 
+                (is-eq tx-sender (get lessor lease-data))
+                (is-eq tx-sender (get lessee lease-data))
+                (>= stacks-block-height (get lease-end lease-data))
+            ) 
+            err-not-token-owner
+        )
+        
+        (map-set heritage-leases token-id 
+            (merge lease-data {active: false}))
+        (ok true)
+    )
+)
+
+(define-public (renew-lease (token-id uint) (new-duration uint) (new-price uint))
+    (let 
+        (
+            (lease-data (unwrap! (map-get? heritage-leases token-id) err-lease-not-found))
+            (new-end-block (+ stacks-block-height new-duration))
+        )
+        (asserts! (get active lease-data) err-lease-not-found)
+        (asserts! (is-eq tx-sender (get lessee lease-data)) err-not-lessee)
+        (asserts! (> new-duration u0) err-invalid-lease-duration)
+        
+        (try! (stx-transfer? new-price tx-sender (get lessor lease-data)))
+        
+        (map-set heritage-leases token-id
+            (merge lease-data {
+                lease-price: new-price,
+                lease-duration: new-duration,
+                lease-start: stacks-block-height,
+                lease-end: new-end-block
+            }))
+        (ok true)
+    )
+)
+
+(define-public (collect-lease-revenue (token-id uint) (amount uint))
+    (let 
+        (
+            (lease-data (unwrap! (map-get? heritage-leases token-id) err-lease-not-found))
+            (revenue-share (/ (* amount (get revenue-sharing lease-data)) u100))
+            (lessee-share (- amount revenue-share))
+        )
+        (asserts! (get active lease-data) err-lease-not-found)
+        (asserts! (< stacks-block-height (get lease-end lease-data)) err-lease-expired)
+        (asserts! (is-eq tx-sender (get lessee lease-data)) err-not-lessee)
+        
+        (try! (stx-transfer? revenue-share tx-sender (get lessor lease-data)))
+        (ok {lessor-revenue: revenue-share, lessee-revenue: lessee-share})
+    )
+)
+
+(define-private (check-applicant (application {applicant: principal, offered-price: uint, requested-duration: uint, application-time: uint, status: (string-ascii 16)}))
+    (is-eq (get applicant application) tx-sender)
+)
+
+(define-read-only (get-heritage-lease (token-id uint))
+    (map-get? heritage-leases token-id)
+)
+
+(define-read-only (get-lease-applications (token-id uint))
+    (map-get? lease-applications token-id)
+)
+
+(define-read-only (get-user-lease-history (user principal))
+    (map-get? user-lease-history user)
+)
+
+(define-read-only (is-lease-active (token-id uint))
+    (match (map-get? heritage-leases token-id)
+        lease-data 
+        (and 
+            (get active lease-data)
+            (< stacks-block-height (get lease-end lease-data))
+        )
+        false
+    )
+)
+
+(define-read-only (get-lease-status (token-id uint))
+    (match (map-get? heritage-leases token-id)
+        lease-data 
+        (some {
+            active: (get active lease-data),
+            lessor: (get lessor lease-data),
+            lessee: (get lessee lease-data),
+            lease-price: (get lease-price lease-data),
+            blocks-remaining: (if (> (get lease-end lease-data) stacks-block-height)
+                                (- (get lease-end lease-data) stacks-block-height)
+                                u0),
+            expired: (>= stacks-block-height (get lease-end lease-data))
+        })
         none
     )
 )
