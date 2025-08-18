@@ -21,6 +21,13 @@
 (define-constant err-site-already-leased (err u116))
 (define-constant err-not-lessee (err u117))
 (define-constant err-lease-payment-failed (err u118))
+(define-constant err-invalid-visitor-verification (err u119))
+(define-constant err-duplicate-visit (err u120))
+(define-constant err-invalid-rating (err u121))
+(define-constant err-visit-not-found (err u122))
+(define-constant err-insufficient-visits (err u123))
+(define-constant err-reward-already-claimed (err u124))
+(define-constant err-invalid-reward-tier (err u125))
 
 (define-data-var last-token-id uint u0)
 (define-data-var base-token-uri (string-ascii 210) "https://cultoken.heritage/metadata/")
@@ -79,6 +86,57 @@
     start-block: uint,
     end-block: uint,
     lease-price: uint
+}))
+
+(define-map site-visitors uint (list 100 {
+    visitor: principal,
+    visit-timestamp: uint,
+    verification-method: (string-ascii 32),
+    visit-duration: uint,
+    coordinates-verified: bool
+}))
+
+(define-map visitor-profile principal {
+    total-visits: uint,
+    total-sites-visited: uint,
+    loyalty-points: uint,
+    preferred-heritage-type: (string-ascii 32),
+    last-visit: uint,
+    tourism-level: (string-ascii 16)
+})
+
+(define-map site-reviews uint (list 50 {
+    reviewer: principal,
+    rating: uint,
+    review-text: (string-ascii 256),
+    visit-verified: bool,
+    helpful-votes: uint,
+    review-timestamp: uint
+}))
+
+(define-map site-tourism-stats uint {
+    total-visitors: uint,
+    total-reviews: uint,
+    average-rating: uint,
+    peak-visit-season: (string-ascii 16),
+    visitor-satisfaction: uint,
+    last-updated: uint
+})
+
+(define-map loyalty-rewards principal (list 20 {
+    reward-tier: (string-ascii 16),
+    reward-description: (string-ascii 128),
+    points-cost: uint,
+    claimed: bool,
+    claim-timestamp: uint
+}))
+
+(define-map tourism-achievements principal (list 30 {
+    achievement-type: (string-ascii 32),
+    achievement-name: (string-ascii 64),
+    description: (string-ascii 128),
+    unlocked-at: uint,
+    sites-involved: (list 10 uint)
 }))
 
 (define-public (get-last-token-id)
@@ -508,6 +566,247 @@
     )
 )
 
+(define-public (check-in-to-site (token-id uint) (verification-method (string-ascii 32)) (visit-duration uint) (coordinates-verified bool))
+(let 
+(
+    (site-data (unwrap! (map-get? heritage-sites token-id) err-not-found))
+    (current-visitors (default-to (list) (map-get? site-visitors token-id)))
+    (visitor-data (default-to {
+            total-visits: u0,
+                total-sites-visited: u0,
+                loyalty-points: u0,
+                preferred-heritage-type: "",
+                last-visit: u0,
+                tourism-level: "novice"
+            } (map-get? visitor-profile tx-sender)))
+            (new-visit {
+                visitor: tx-sender,
+                visit-timestamp: stacks-block-height,
+                verification-method: verification-method,
+                visit-duration: visit-duration,
+                coordinates-verified: coordinates-verified
+            })
+        )
+        (asserts! (> visit-duration u0) err-invalid-visitor-verification)
+        (asserts! (is-none (element-at? (filter check-duplicate-visit current-visitors) u0)) err-duplicate-visit)
+        
+        (map-set site-visitors token-id
+            (unwrap! (as-max-len? (append current-visitors new-visit) u100) (err u999)))
+        
+        (let 
+            (
+                (points-earned (calculate-visit-points visit-duration coordinates-verified))
+                (new-total-visits (+ (get total-visits visitor-data) u1))
+                (updated-sites-visited (if (is-none (map-get? site-visitors token-id)) 
+                                         (+ (get total-sites-visited visitor-data) u1)
+                                         (get total-sites-visited visitor-data)))
+            )
+            (map-set visitor-profile tx-sender {
+                total-visits: new-total-visits,
+                total-sites-visited: updated-sites-visited,
+                loyalty-points: (+ (get loyalty-points visitor-data) points-earned),
+                preferred-heritage-type: (get heritage-type site-data),
+                last-visit: stacks-block-height,
+                tourism-level: (calculate-tourism-level new-total-visits)
+            })
+            
+            (try! (update-site-tourism-stats token-id))
+            (ok {points-earned: points-earned, total-points: (+ (get loyalty-points visitor-data) points-earned)})
+        )
+    )
+)
+
+(define-public (submit-site-review (token-id uint) (rating uint) (review-text (string-ascii 256)))
+    (let 
+        (
+            (site-data (unwrap! (map-get? heritage-sites token-id) err-not-found))
+            (current-reviews (default-to (list) (map-get? site-reviews token-id)))
+            (visit-verified (has-visited-site token-id tx-sender))
+            (new-review {
+                reviewer: tx-sender,
+                rating: rating,
+                review-text: review-text,
+                visit-verified: visit-verified,
+                helpful-votes: u0,
+                review-timestamp: stacks-block-height
+            })
+        )
+        (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+        
+        (map-set site-reviews token-id
+            (unwrap! (as-max-len? (append current-reviews new-review) u50) (err u999)))
+        
+        (if visit-verified
+            (let ((visitor-data (unwrap! (map-get? visitor-profile tx-sender) err-visit-not-found)))
+                (map-set visitor-profile tx-sender
+                    (merge visitor-data {
+                        loyalty-points: (+ (get loyalty-points visitor-data) u10)
+                    }))
+                (ok true)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (claim-loyalty-reward (reward-tier (string-ascii 16)) (points-cost uint))
+    (let 
+        (
+            (visitor-data (unwrap! (map-get? visitor-profile tx-sender) err-visit-not-found))
+            (current-rewards (default-to (list) (map-get? loyalty-rewards tx-sender)))
+            (reward-description (get-reward-description reward-tier))
+        )
+        (asserts! (>= (get loyalty-points visitor-data) points-cost) err-insufficient-visits)
+        (asserts! (is-some reward-description) err-invalid-reward-tier)
+        
+        (let 
+            (
+                (new-reward {
+                    reward-tier: reward-tier,
+                    reward-description: (unwrap-panic reward-description),
+                    points-cost: points-cost,
+                    claimed: true,
+                    claim-timestamp: stacks-block-height
+                })
+            )
+            (map-set loyalty-rewards tx-sender
+                (unwrap! (as-max-len? (append current-rewards new-reward) u20) (err u999)))
+            
+            (map-set visitor-profile tx-sender
+                (merge visitor-data {
+                    loyalty-points: (- (get loyalty-points visitor-data) points-cost)
+                }))
+            (ok true)
+        )
+    )
+)
+
+(define-public (update-site-tourism-stats (token-id uint))
+    (let 
+        (
+            (site-data (unwrap! (map-get? heritage-sites token-id) err-not-found))
+            (visitors (default-to (list) (map-get? site-visitors token-id)))
+            (reviews (default-to (list) (map-get? site-reviews token-id)))
+            (total-visitors (len visitors))
+            (total-reviews (len reviews))
+            (average-rating (calculate-average-rating reviews))
+        )
+        (map-set site-tourism-stats token-id {
+            total-visitors: total-visitors,
+            total-reviews: total-reviews,
+            average-rating: average-rating,
+            peak-visit-season: "summer",
+            visitor-satisfaction: (calculate-satisfaction-score average-rating total-reviews),
+            last-updated: stacks-block-height
+        })
+        (ok true)
+    )
+)
+
+(define-private (check-duplicate-visit (visit {visitor: principal, visit-timestamp: uint, verification-method: (string-ascii 32), visit-duration: uint, coordinates-verified: bool}))
+    (and 
+        (is-eq (get visitor visit) tx-sender)
+        (> (- stacks-block-height (get visit-timestamp visit)) u144)
+    )
+)
+
+(define-private (calculate-visit-points (duration uint) (coordinates-verified bool))
+    (let 
+        (
+            (base-points (if (> duration u60) u20 u10))
+            (verification-bonus (if coordinates-verified u5 u0))
+        )
+        (+ base-points verification-bonus)
+    )
+)
+
+(define-private (calculate-tourism-level (total-visits uint))
+    (if (>= total-visits u50)
+        "expert"
+        (if (>= total-visits u20)
+            "advanced"
+            (if (>= total-visits u5)
+                "intermediate"
+                "novice"
+            )
+        )
+    )
+)
+
+(define-private (has-visited-site (token-id uint) (visitor principal))
+    (let ((visitors (default-to (list) (map-get? site-visitors token-id))))
+        (is-some (element-at? (filter check-visitor-match visitors) u0))
+    )
+)
+
+(define-private (check-visitor-match (visit {visitor: principal, visit-timestamp: uint, verification-method: (string-ascii 32), visit-duration: uint, coordinates-verified: bool}))
+    (is-eq (get visitor visit) tx-sender)
+)
+
+(define-private (calculate-average-rating (reviews (list 50 {reviewer: principal, rating: uint, review-text: (string-ascii 256), visit-verified: bool, helpful-votes: uint, review-timestamp: uint})))
+    (let 
+        (
+            (total-reviews (len reviews))
+            (total-rating (fold + (map get-rating reviews) u0))
+        )
+        (if (> total-reviews u0)
+            (/ total-rating total-reviews)
+            u0
+        )
+    )
+)
+
+(define-private (get-rating (review {reviewer: principal, rating: uint, review-text: (string-ascii 256), visit-verified: bool, helpful-votes: uint, review-timestamp: uint}))
+    (get rating review)
+)
+
+(define-private (calculate-satisfaction-score (average-rating uint) (total-reviews uint))
+    (let 
+        (
+            (rating-weight (* average-rating u20))
+            (review-weight (if (> total-reviews u10) u20 (* total-reviews u2)))
+        )
+        (/ (+ rating-weight review-weight) u2)
+    )
+)
+
+(define-private (get-reward-description (tier (string-ascii 16)))
+    (if (is-eq tier "bronze")
+        (some "Heritage Explorer Badge - 5% discount on future visits")
+        (if (is-eq tier "silver")
+            (some "Cultural Ambassador Status - 10% discount and priority access")
+            (if (is-eq tier "gold")
+                (some "Heritage Guardian Title - 20% discount and exclusive events")
+                none
+            )
+        )
+    )
+)
+
+(define-read-only (get-site-visitors (token-id uint))
+    (map-get? site-visitors token-id)
+)
+
+(define-read-only (get-visitor-profile (visitor principal))
+    (map-get? visitor-profile visitor)
+)
+
+(define-read-only (get-site-reviews (token-id uint))
+    (map-get? site-reviews token-id)
+)
+
+(define-read-only (get-site-tourism-stats (token-id uint))
+    (map-get? site-tourism-stats token-id)
+)
+
+(define-read-only (get-loyalty-rewards (visitor principal))
+    (map-get? loyalty-rewards visitor)
+)
+
+(define-read-only (get-tourism-achievements (visitor principal))
+    (map-get? tourism-achievements visitor)
+)
+
 (define-read-only (get-contract-info)
     {
         total-tokens: (var-get last-token-id),
@@ -516,3 +815,5 @@
         base-uri: (var-get base-token-uri)
     }
 )
+
+
